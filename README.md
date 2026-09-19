@@ -90,6 +90,18 @@ python -m cli profile --model toy
 python -m cli benchmark --model toy
 ```
 
+## UI + Agent
+
+```bash
+# Terminal 1 — engine API
+python -m engine.api
+
+# Terminal 2 — developer UI
+cd ui && npm install && npm run dev
+```
+
+Open http://localhost:5173 — use the agent panel (`generate a cat image`, `run experiment`, `profile`, …).
+
 ## Architecture layers
 
 | Layer   | Role                                      |
