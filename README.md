@@ -4,6 +4,14 @@ CPU-first engine for analyzing, profiling, and optimizing **diffusion-model infe
 
 ## Screenshots
 
+### Developer UI
+
+![CPU Diffusion Optimizer UI](docs/screenshots/ui.png)
+
+Cursor-like workspace: explorer, benchmark view, terminal, and the **AI Optimization Agent**.
+
+### Sample outputs
+
 Sample outputs from the agent / image pipeline (CPU):
 
 | Cat | Dog |
