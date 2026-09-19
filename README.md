@@ -3,7 +3,7 @@
 CPU-first engine for analyzing, profiling, and optimizing **diffusion-model inference** on CPUs.
 
 <p align="center">
-  <img src="screenshots/ui.png" alt="CPU Diffusion Optimizer UI — agent generating a cat image" width="100%" />
+  <img src="docs/screenshots/ui.png" alt="CPU Diffusion Optimizer UI — agent generating a cat image" width="100%" />
 </p>
 
 **Developer UI** — Cursor-like workspace with explorer, benchmark view, terminal, and the **AI Optimization Agent**. The panel above shows `generate a cat image` with the result rendered inline.
@@ -12,15 +12,15 @@ CPU-first engine for analyzing, profiling, and optimizing **diffusion-model infe
 
 | Cat | Dog |
 |-----|-----|
-| ![Cat](screenshots/demo_cat.png) | ![Dog](screenshots/demo_dog.png) |
+| ![Cat](docs/screenshots/demo_cat.png) | ![Dog](docs/screenshots/demo_dog.png) |
 
 | Generated cat | Generated dog |
 |---------------|---------------|
-| ![Generated cat](screenshots/generated_cat.png) | ![Generated dog](screenshots/generated_dog.png) |
+| ![Generated cat](docs/screenshots/generated_cat.png) | ![Generated dog](docs/screenshots/generated_dog.png) |
 
 | Generated cow | Generated apple |
 |---------------|-----------------|
-| ![Generated cow](screenshots/generated_cow.png) | ![Generated apple](screenshots/generated_apple.png) |
+| ![Generated cow](docs/screenshots/generated_cow.png) | ![Generated apple](docs/screenshots/generated_apple.png) |
 
 This is **not** primarily an image-generation UI. The core product is an **optimization engine** that:
 
