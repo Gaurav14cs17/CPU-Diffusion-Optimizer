@@ -8,7 +8,7 @@ CPU-first engine for analyzing, profiling, and optimizing **diffusion-model infe
 
 ![CPU Diffusion Optimizer UI](docs/screenshots/ui.png)
 
-Cursor-like workspace: explorer, benchmark view, terminal, and the **AI Optimization Agent**.
+Cursor-like workspace with the **AI Optimization Agent** generating an image (`generate a cat image`) shown inline in the composer panel.
 
 ### Sample outputs
 
