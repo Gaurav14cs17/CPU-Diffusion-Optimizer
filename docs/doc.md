@@ -1,295 +1,302 @@
 # Technical Discussion — CPU Diffusion Optimizer
 
-This document is for technical discussion of goals, design choices, pipeline behavior, and open questions. It complements the shorter notes in `architecture.md`, `caching.md`, and `cpu_optimization.md`.
+Pipeline-first technical reference. Complements `architecture.md`, `caching.md`, and `cpu_optimization.md`.
 
 ---
 
-## 1. Problem statement
+## 1. Problem and product
 
-Diffusion inference is usually discussed in a **GPU** context (CUDA kernels, VRAM, batch throughput). Many real deployments still need **CPU** paths:
+Diffusion inference is usually a **GPU** story. Many deployments still need **CPU** paths (edge, cost, compliance, CI). On CPUs, diffusion is often **memory-bandwidth bound**; naïve GPU recipes fail or overclaim.
 
-- Edge / laptop / cloud instances without GPUs
-- Cost or compliance constraints
-- Debugging, CI, and reproducible research harnesses
+**Core question:**
 
-On CPUs, diffusion is often **memory-bandwidth bound** rather than pure FLOP-bound. Naïve “port the GPU recipe” (same caches, same quantization claims without measured kernels) fails or lies.
+> Can we systematically *discover*, *apply*, and *accept or reject* CPU-side optimizations using measured evidence?
 
-**Core question this project asks:**
-
-> Can we systematically *discover*, *apply*, and *accept or reject* CPU-side optimizations for diffusion inference using measured evidence — not vibes?
-
----
-
-## 2. Goals and non-goals
-
-### Goals
-
-| Goal | Meaning |
-|------|---------|
-| CPU-first engine | Primary path is x86 (AVX2/AVX-512) and ARM NEON where practical |
-| Evidence loop | Every optimization is benchmarked + quality-gated |
-| Pluggable frontends | CLI, library API, agent tools, UI — all call the same engine |
-| Incremental phases | Toy model first; real UNet/DiT adapters later without rewriting the loop |
-
-### Non-goals (for now)
-
-- Shipping a consumer image-generation product
-- Claiming Stable Diffusion / FLUX speedups without adapters + real weights
-- Accepting “optimizations” that do not change measured latency or that break quality gates
-- Making the engine depend on the UI or agent
-
----
-
-## 3. System architecture
+**Product:** an evidence loop, not an image-generation app. Frontends (CLI, API, agent, UI) only call the engine.
 
 ```
-┌─────────────┐     ┌─────────────┐
-│     UI      │────►│     API     │──┐
-└─────────────┘     └─────────────┘  │
-                                     ▼
-┌─────────────┐                  ┌─────────────┐
-│    Agent    │─────────────────►│   Engine    │
-└─────────────┘                  └─────────────┘
-┌─────────────┐                         ▲
-│     CLI     │─────────────────────────┘
-└─────────────┘
+UI ──► API ──► Engine
+Agent ───────► Engine
+CLI ─────────► Engine
 ```
-
-**Dependency rule:** edges point *into* the engine. The engine is a standalone Python library.
-
-| Layer | Responsibility |
-|-------|----------------|
-| **Engine** | Load, graph, profile, cache, optimize, benchmark, quality, experiments |
-| **CLI** | Headless entry (`python -m cli …`) |
-| **API** | HTTP surface for UI / automation |
-| **Agent** | Maps natural language → engine tools |
-| **UI** | Developer IDE-like console; no optimization logic |
 
 ---
 
-## 4. End-to-end pipeline
+## 2. Pipeline overview
 
-The vertical slice implemented by `ExperimentRunner`:
+Implemented by `ExperimentRunner` (`engine/experiments/runner.py`):
 
 ```
-Config
-  → Load model (adapter)
-  → Build computation graph
-  → CPU profile (latency / memory / hardware)
-  → Baseline benchmark (cache OFF)
-  → Optimized path (e.g. CPU-aware block cache)
-  → Paired quality check (same seed)
-  → Compare metrics → KEEP / REJECT / INCONCLUSIVE
-  → Persist artifacts under results/
+┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│  Config  │──►│   Load   │──►│  Graph   │──►│ Profile  │
+└──────────┘   └──────────┘   └──────────┘   └──────────┘
+                                                      │
+     ┌────────────────────────────────────────────────┘
+     ▼
+┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│ Baseline │──►│ Optimize │──►│ Quality  │──►│ Decision │
+│ bench    │   │ + bench  │   │ (paired) │   │ KEEP/…   │
+└──────────┘   └──────────┘   └──────────┘   └──────────┘
+                                                      │
+                                                      ▼
+                                               ┌──────────┐
+                                               │ Persist  │
+                                               │ results/ │
+                                               └──────────┘
 ```
 
-### Decision policy (summary)
+| Stage | Module(s) | Output |
+|-------|-----------|--------|
+| **Config** | `EngineConfig`, YAML (`configs/*.yaml`) | Hypothesis + knobs |
+| **Load** | `load_model`, adapters | `LoadedModel` (module + adapter) |
+| **Graph** | `adapter.build_graph` | Normalized `ModelGraph` |
+| **Profile** | `Profiler` | Latency / memory / CPU info |
+| **Baseline** | `Benchmark` (cache OFF) | `baseline.json` metrics |
+| **Optimize** | `CacheManager` + modes | Cached inference path |
+| **Optimized bench** | `Benchmark` (cache ON) | `optimized.json`, cache stats |
+| **Quality** | `QualityValidator` (same seed) | MSE / PSNR gate |
+| **Decision** | `compare` | KEEP / REJECT / INCONCLUSIVE |
+| **Persist** | runner + `ExperimentDatabase` | Artifacts under `results/` |
 
-| Condition | Decision |
-|-----------|----------|
-| Quality fails gates | **REJECT** |
-| Quality OK + measured speedup ≥ 1× | **KEEP** |
-| Quality OK + no net speedup | **INCONCLUSIVE** |
-| Cache disabled (identity path) | **INCONCLUSIVE** |
+CLI entry for the full pipeline:
 
-No optimization is accepted without **paired** measurement.
+```bash
+python -m cli experiment --config configs/cache.yaml
+```
 
-### Artifacts
-
-Typical outputs in `results/`:
-
-- `baseline.json`, `optimized.json`, `comparison.json`
-- `profile.json` / `profile.txt`
-- `cache_stats.json`, `cache_log.json`
-- `report.md`
-- `images/baseline.png`, `images/optimized.png`
-- `experiments.sqlite`
+Partial stages via CLI: `analyze`, `profile`, `benchmark`.
 
 ---
 
-## 5. Model choice
+## 3. Stage: Config
 
-### Experiment / optimize path
+Inputs that drive every later stage:
 
-Default model is **`toy_diffusion`** (`examples/toy_diffusion/model.py`):
+| Knob | Role in pipeline |
+|------|------------------|
+| `model.kind` / `name` | Which adapter loads |
+| `model.num_steps`, `batch_size` | Inference shape |
+| `cache.mode`, `threshold` | Optimize-stage policy |
+| `benchmark.quality` | Quality-stage gates (`max_mse`, `min_psnr`) |
+| `experiment.seed`, `output_dir` | Paired runs + artifact path |
 
-- Small DiT-like stack of residual blocks (attention + MLP)
-- No external checkpoints
-- Deterministic for a fixed seed
-- Sized for fast CPU iteration (config example: 32×32 latent, 6 blocks, 24 steps)
-
-**Why toy first?** The product is the *optimization engine*, not a particular foundation model. Toy weights let us validate graph extraction, profiling, cache decisions, and the accept/reject loop before investing in heavy adapters.
-
-### Adapters (extensibility)
-
-Loader resolves `ModelConfig.kind` through a registry:
-
-- `toy_diffusion` — implemented (default experiment path)
-- `diffusers` — offline CPU Diffusers (e.g. `stabilityai/sd-turbo`)
-- `fastsdcpu` / `openvino` — FastSDCPU-**aligned** baseline (same Turbo/OpenVINO model class as [rupeshs/fastsdcpu](https://github.com/rupeshs/fastsdcpu); does not vendor that app). Install: `pip install -e ".[fastsdcpu]"`. Config: `configs/fastsdcpu.yaml`
-- `pytorch` — scaffolding for custom `nn.Module` checkpoints
-
-**Why not FastSDCPU as the default?** That project is a consumer image app (GUI + distilled few-step models + OpenVINO). This repo’s product is the *evidence loop* (profile → optimize → quality-gate). FastSDCPU-class models are a **baseline adapter** for later real-UNet measurements, not a replacement for `toy_diffusion`.
-
-### Image chat path (offline CPU, multi-model)
-
-UI/agent image gen uses a **catalog** (`configs/txt2img_models.yaml`):
-
-| Key | HF / kind | Notes |
-|-----|-----------|--------|
-| `sd-turbo` | `stabilityai/sd-turbo` | Default, 2-step |
-| `sdxl-turbo` | `stabilityai/sdxl-turbo` | Heavier turbo |
-| `sdxs` | `IDKiro/sdxs-512-0.9` | 1-step (FastSD-style) |
-| `bk-sdm-tiny` | `nota-ai/bk-sdm-tiny` | Small compressed SD |
-| `tiny-sd` | `segmind/tiny-sd` | Compact distill |
-| `lcm-dreamshaper` | `SimianLuo/LCM_Dreamshaper_v7` | LCM few-step |
-| `toy` | builtin | Latent fallback |
-
-Agent / UI:
-
-- `list models` · model picker dropdown · **Auto**
-- `use model sdxs`
-- `generate a cat image` / **Generate**
-- **Upload** an image → type guidance → **Edit** (img2img, strength slider)
-
-Env overrides: `CDO_TXT2IMG_MODEL`, `CDO_TXT2IMG_STEPS`, `CDO_TXT2IMG_SIZE`, `CDO_TXT2IMG_CATALOG`. Install: `pip install -e ".[diffusers]"`.
+Default experiment config: `configs/cache.yaml` (CPU-aware cache mode).
 
 ---
 
-## 6. Caching discussion
+## 4. Stage: Load + Graph
 
-### Motivation
+```
+ModelConfig.kind
+  → MODEL_ADAPTERS registry
+  → adapter.load → to_cpu → build_graph → info
+  → LoadedModel
+```
 
-Adjacent diffusion timesteps often produce similar intermediate activations. Reusing block outputs when change is small can skip compute — analogous in spirit to LLM KV cache, but along the **timestep** axis and with **approximate** reuse risk.
+| `kind` | Role in pipeline | Notes |
+|--------|------------------|--------|
+| `toy_diffusion` | **Default experiment path** | Small DiT-like stack; no checkpoints; fast CPU loop |
+| `diffusers` | Real offline CPU Diffusers | e.g. `stabilityai/sd-turbo` |
+| `fastsdcpu` / `openvino` | FastSDCPU-aligned baseline | `pip install -e ".[fastsdcpu]"`; `configs/fastsdcpu.yaml` |
+| `pytorch` | Custom `nn.Module` scaffolding | Early |
 
-| | LLM KV cache | Diffusion feature / block cache |
-|--|--------------|-----------------------------------|
-| Axis | Token sequence | Denoising timestep |
-| Stored | K/V | Block / feature maps |
-| Exactness | Usually exact | Approximate → must quality-gate |
+**Why toy first?** The pipeline (graph → profile → cache → gate) is the product. Validate stages before heavy adapters.
 
-### Stability metric
+Graph is built at load time so profiling and cache hooks attach to named blocks, not opaque pipelines.
+
+---
+
+## 5. Stage: Profile
+
+`Profiler` runs a timed CPU pass on the loaded model:
+
+- Operator / block latency
+- Peak memory / RSS pressure
+- Hardware snapshot (`inspect_cpu`: AVX2 / AVX-512 / NEON where available)
+
+Feeds hotspot intuition and cost-model inputs for the optimize stage. Artifacts: `profile.json`, `profile.txt`.
+
+CPU-bound stance for this stage and later opts:
+
+- Memory bandwidth and tensor copies matter as much as FLOPs
+- Threading (`torch` / OMP), layout, locality
+- Planned later in the same pipeline slot: fusion, INT8 (real kernels), INT4 — fake quant that does not change kernels is not a win
+
+---
+
+## 6. Stage: Baseline benchmark
+
+Always runs with **cache disabled**:
+
+```
+Benchmark.run(loaded, seed=…, label="baseline")
+```
+
+Warmup + repeated timed measurements. Establishes the paired reference for speedup and quality. Artifact: `baseline.json`.
+
+---
+
+## 7. Stage: Optimize (cache path)
+
+Adjacent timesteps often have similar block activations. The optimize stage tries **reuse** along the timestep axis (approximate → must pass quality).
+
+### Stability (candidate)
 
 \[
 D(l,t) = \frac{\|F(l,t) - F(l,t-1)\|}{\|F(l,t-1)\| + \varepsilon}
 \]
 
-If \(D(l,t) < \tau\), the block is a **reuse candidate**.
+If \(D(l,t) < \tau\), block \(l\) at step \(t\) is a reuse candidate.
 
-### CPU-aware gate
+### CPU-aware gate (accept reuse)
 
-Even if features are stable, reuse must be cheaper than compute:
+Even if stable, reuse only when cheaper than compute:
 
 \[
 T_{\text{reuse}} < T_{\text{compute}}
 \]
 
-`BandwidthCostModel` approximates:
+`BandwidthCostModel`: \(T_{\text{compute}}\) ≈ measured block latency; \(T_{\text{reuse}}\) ≈ bytes / DRAM bandwidth + lookup (+ optional decompress).
 
-- \(T_{\text{compute}}\) ≈ measured block latency
-- \(T_{\text{reuse}}\) ≈ `bytes / DRAM_bandwidth + lookup (+ optional decompress)`
+### Modes (pipeline knobs)
 
-Default experimental mode: **`cpu_aware`** (`configs/cache.yaml`).
+| Mode | Behavior in this stage |
+|------|------------------------|
+| Disabled | Identity path (no optimize) |
+| Static block cache | Fixed block reuse |
+| Timestep-based | Reuse by step schedule |
+| Adaptive feature | Stability threshold only |
+| **CPU-aware** (default experimental) | Stability **and** \(T_{\text{reuse}} < T_{\text{compute}}\) |
 
-### Modes
+Runtime: `CacheManager` wraps `adapter.run_inference(..., cache_manager=…)`. Artifacts: `cache_log.json`, `cache_stats.json`, hit rate on optimized metrics.
 
-1. Disabled  
-2. Static block cache  
-3. Timestep-based cache  
-4. Adaptive feature cache  
-5. CPU-aware adaptive cache  
-
-### Open discussion points
-
-- Calibrating DRAM bandwidth per machine instead of a fixed guess (~20 GB/s)
-- Cap on consecutive reuses (`max_consecutive_reuses`) vs quality drift
-- Spatial / tile caching (`RegionKey`) for large feature maps
-- Interaction with INT8 and fused ops (reuse of quantized tensors)
+Open knobs: per-machine DRAM calibration, `max_consecutive_reuses`, spatial/tile keys, interaction with INT8.
 
 ---
 
-## 7. CPU optimization stance
+## 8. Stage: Optimized benchmark
 
-Designed considerations:
+Same `Benchmark` harness as baseline, with cache-enabled `inference_fn` when optimize is on. Artifact: `optimized.json` (+ cache hit / memory fields when available).
 
-- ISA detection: AVX2 / AVX-512 / NEON
-- Peak RSS / RAM pressure
-- Tensor copies and layout / cache locality
-- Threading (`torch` / OMP)
-- Planned: operator fusion, INT8 (real kernels), INT4 later
+If cache is off, this stage is an identity re-run (feeds INCONCLUSIVE later).
 
-Quantization path (aspirational):
+---
+
+## 9. Stage: Quality (paired)
+
+Same seed for both paths:
 
 ```
-FP32 → FP16/BF16 (where useful on CPU) → INT8 → INT4
+baseline_out  = run_inference(…, seed=S)           # no cache
+optimized_out = run_inference(…, seed=S, cache=…)  # optimize path
+QualityValidator.evaluate(baseline_out, optimized_out)
 ```
 
-Fake quantization that does not change kernels is **not** treated as a real win.
+Metrics: MSE, PSNR (SSIM later). Gates from config. Failures force **REJECT** regardless of speedup.
+
+Latent visualizations: `images/baseline.png`, `images/optimized.png`.
 
 ---
 
-## 8. Benchmark and quality methodology
+## 10. Stage: Decision
 
-Every claim should come from:
+| Condition | Decision |
+|-----------|----------|
+| Quality fails gates | **REJECT** |
+| Quality OK + speedup ≥ 1× | **KEEP** |
+| Quality OK + no net speedup | **INCONCLUSIVE** |
+| Cache disabled (identity) | **INCONCLUSIVE** |
 
-1. Warmup runs  
-2. Repeated timed measurements  
-3. Quality metrics (MSE, PSNR; SSIM optional later)  
-4. Accept only if gates pass (`max_mse`, `min_psnr` in config)
-
-Paired seeds ensure baseline vs optimized compare the same stochastic draw.
-
----
-
-## 9. Agent and UI
-
-Agent tools wrap the engine (`profile_model`, `run_experiment`, `compare_results`, `generate_image`, …). The UI is a Cursor-like shell: explorer, artifact views, terminal, composer. Optimization math stays in the engine.
-
-Discussion topics for later:
-
-- How much planning/reasoning belongs in the agent vs fixed tool scripts  
-- Safe auto-patch loops (propose config/code change → re-run experiment → keep/revert)  
-- Multi-model experiment matrices in the UI  
+No optimization is accepted without **paired** measurement. Open: require a noise margin (e.g. ≥ 1.05×) before KEEP.
 
 ---
 
-## 10. Design tradeoffs
+## 11. Stage: Persist
+
+Typical `results/`:
+
+```
+results/
+├── baseline.json
+├── optimized.json
+├── comparison.json
+├── profile.json / profile.txt
+├── cache_stats.json / cache_log.json
+├── report.md
+├── experiment.json
+├── experiments.sqlite
+└── images/
+    ├── baseline.png
+    └── optimized.png
+```
+
+---
+
+## 12. Side pipelines (same engine)
+
+Not the experiment vertical slice, but same load/inference surface:
+
+### Image chat (offline CPU catalog)
+
+`configs/txt2img_models.yaml` → agent/UI generate / edit:
+
+| Key | Notes |
+|-----|--------|
+| `sd-turbo` | Default, 2-step |
+| `sdxl-turbo` | Heavier turbo |
+| `sdxs` | 1-step (FastSD-style) |
+| `bk-sdm-tiny` / `tiny-sd` | Compact |
+| `lcm-dreamshaper` | LCM few-step |
+| `toy` | Latent fallback |
+
+Env: `CDO_TXT2IMG_MODEL`, `CDO_TXT2IMG_STEPS`, `CDO_TXT2IMG_SIZE`, `CDO_TXT2IMG_CATALOG`. Install: `pip install -e ".[diffusers]"`.
+
+### Agent / API / UI
+
+Agent tools (`profile_model`, `run_experiment`, `compare_results`, `generate_image`, …) invoke engine stages. UI is a console only — no optimization math. Future: auto-patch loop (propose change → re-run pipeline → keep/revert).
+
+---
+
+## 13. Goals, non-goals, tradeoffs
+
+**Goals:** CPU-first engine · evidence loop · pluggable frontends · incremental adapters without rewriting the pipeline.
+
+**Non-goals (for now):** consumer image product · SD/FLUX speed claims without adapters · accepting unmeasured “wins” · engine depending on UI/agent.
 
 | Choice | Benefit | Cost |
 |--------|---------|------|
-| Toy model first | Fast, deterministic CI | No SD/FLUX numbers yet |
-| Evidence-required KEEP | Trustworthy claims | Slow iteration; many INCONCLUSIVE on tiny models |
-| CPU-aware cache | Avoids reuse that is slower than compute | Needs good bandwidth / latency estimates |
-| Separate image-gen via same pipeline | Offline, consistent with engine | Toy latents ≠ photoreal demos |
-| Engine independence | Library-usable | More packaging discipline |
+| Toy default in pipeline | Fast CI, deterministic | No SD-scale numbers yet |
+| Evidence-required KEEP | Trustworthy | Many INCONCLUSIVE on tiny models |
+| CPU-aware in optimize stage | Avoids slow reuse | Needs good bandwidth estimates |
+| Shared engine for image chat | One load/infer path | Toy latents ≠ photoreal demos |
 
 ---
 
-## 11. Phase roadmap (discussion)
+## 14. Phase roadmap (by pipeline maturity)
 
-| Phase | Focus | Notes |
-|-------|--------|------|
-| 1 | Toy, graph, profiler, benchmark | Done |
-| 2 | Feature/block cache + stability | Wired in runner |
-| 3 | Cost model calibration, experiments DB | Partial |
-| 4 | INT8, memory, block skipping | Stub / early |
-| 5 | Agent tools + patch loop | Tools exist; patch loop early |
-| 6 | API + UI | Working vertical slice |
-
----
-
-## 12. Open questions for discussion
-
-1. When is block reuse net-negative on small models (toy) but positive on SD-scale UNets?  
-2. Should KEEP require a minimum speedup margin (e.g. ≥ 1.05×) to absorb noise?  
-3. How do we report **energy** / thermal throttling on laptops?  
-4. What’s the right abstraction for Diffusers pipelines (full pipeline vs UNet-only)?  
-5. Can the agent propose cache thresholds from profile hotspots automatically?  
-6. How should we version experiment configs so results are comparable across commits?
+| Phase | Pipeline focus | Status |
+|-------|----------------|--------|
+| 1 | Load → graph → profile → baseline bench | Done |
+| 2 | Optimize (feature/block cache) + quality gate | Wired in runner |
+| 3 | Cost-model calibration, experiments DB | Partial |
+| 4 | INT8 / memory / block skipping in optimize slot | Stub / early |
+| 5 | Agent tools + patch loop around pipeline | Tools exist; patch early |
+| 6 | API + UI frontends | Working vertical slice |
 
 ---
 
-## 13. How to reproduce the discussion baseline
+## 15. Open questions
+
+1. When is block reuse net-negative on toy but positive on SD-scale UNets?  
+2. Should KEEP require a minimum speedup margin (e.g. ≥ 1.05×)?  
+3. How to report energy / thermal throttling on laptops?  
+4. Diffusers abstraction: full pipeline vs UNet-only in load/graph?  
+5. Can the agent set cache thresholds from profile hotspots?  
+6. How to version configs so `results/` are comparable across commits?
+
+---
+
+## 16. Reproduce
 
 ```bash
 python -m venv .venv
@@ -303,16 +310,16 @@ Inspect `results/report.md` and `results/comparison.json` for the measured decis
 
 ---
 
-## 14. Related docs
+## 17. Related docs
 
 | Doc | Scope |
 |-----|--------|
 | `architecture.md` | Layer diagram, pipeline one-liner |
-| `caching.md` | Feature/block cache theory |
+| `caching.md` | Feature/block cache theory (optimize stage) |
 | `cpu_optimization.md` | CPU-bound notes + methodology |
 | `agent.md` | Agent tool surface |
 | `api.md` | HTTP API |
 
 ---
 
-*This document is intended as a living technical discussion artifact. Update it when pipeline semantics, cache policy, or model adapters change.*
+*Living doc. Update when pipeline stages, cache policy, or adapters change.*
