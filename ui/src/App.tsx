@@ -97,7 +97,6 @@ export default function App() {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [generatedImages, setGeneratedImages] = useState<string[]>([]);
   const [generatedCaption, setGeneratedCaption] = useState("");
-  const [sourceImageUrl, setSourceImageUrl] = useState<string | null>(null);
   const [sourceImagePath, setSourceImagePath] = useState<string | null>(null);
   const [editStrength, setEditStrength] = useState(0.55);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -187,7 +186,6 @@ export default function App() {
       }
       const up = await uploadTxt2ImgSource(file);
       const url = `${up.url}${up.url.includes("?") ? "&" : "?"}t=${Date.now()}`;
-      setSourceImageUrl(url);
       setSourceImagePath(up.path);
       setGeneratedImages([url]);
       setGeneratedCaption(
@@ -222,7 +220,6 @@ export default function App() {
   }
 
   function clearSourceImage() {
-    setSourceImageUrl(null);
     setSourceImagePath(null);
     setGeneratedImages([]);
     setGeneratedCaption("");
@@ -257,7 +254,6 @@ export default function App() {
       if (result.url) {
         const path = result.url.replace(/^\/results\//, "").split("?")[0];
         setSourceImagePath(path);
-        setSourceImageUrl(result.url);
       }
       setAgentInput("");
       openScreen("generated", "edited.png");
@@ -516,6 +512,7 @@ export default function App() {
               generatedImages,
               generatedCaption,
               activeModel: txt2imgActive,
+              hasSource: Boolean(sourceImagePath),
             })}
           </div>
 
@@ -770,6 +767,7 @@ function renderEditor(args: {
   generatedImages: string[];
   generatedCaption: string;
   activeModel: string;
+  hasSource: boolean;
 }) {
   const {
     screen,
@@ -782,6 +780,7 @@ function renderEditor(args: {
     generatedImages,
     generatedCaption,
     activeModel,
+    hasSource,
   } = args;
 
   if (screen === "generated") {
@@ -790,10 +789,10 @@ function renderEditor(args: {
       <div className={`doc generated-view ${hasImage ? "" : "is-clean"}`}>
         {hasImage ? (
           <div className="generated-head">
-            <h1>{sourceImagePath ? "Source / edited image" : "Generated image"}</h1>
+            <h1>{hasSource ? "Source / edited image" : "Generated image"}</h1>
             <p className="muted">
               Model: <code>{activeModel}</code>
-              {sourceImagePath ? (
+              {hasSource ? (
                 <>
                   {" · "}
                   source ready for text-guided edit
@@ -814,7 +813,15 @@ function renderEditor(args: {
           {hasImage ? (
             generatedImages.map((src) => (
               <a key={src} href={src} target="_blank" rel="noreferrer" className="generated-frame">
-                <img src={src} alt="generated" />
+                <img
+                  src={src}
+                  alt={hasSource ? "uploaded source" : "generated"}
+                  onError={(e) => {
+                    const el = e.currentTarget;
+                    el.style.outline = "2px solid #c44";
+                    el.alt = "Failed to load image";
+                  }}
+                />
               </a>
             ))
           ) : (
