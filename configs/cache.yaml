@@ -1,0 +1,42 @@
+# Full vertical-slice experiment: profile → baseline → CPU-aware cache → compare
+
+experiment:
+  name: toy_cpu_aware_cache
+  seed: 42
+  output_dir: results
+
+model:
+  name: toy
+  kind: toy_diffusion
+  path: null
+  channels: 4
+  height: 32
+  width: 32
+  hidden_dim: 64
+  num_blocks: 6
+  num_steps: 24
+  batch_size: 1
+
+profiler:
+  warmup_runs: 1
+  measure_runs: 2
+  track_memory: true
+
+benchmark:
+  warmup_runs: 1
+  measure_runs: 2
+  quality:
+    metrics: [mse, psnr]
+    max_mse: 0.25
+    min_psnr: 12.0
+
+cache:
+  mode: cpu_aware
+  threshold: 0.05
+  epsilon: 1.0e-6
+  max_consecutive_reuses: 1
+
+optimization:
+  enable_cache: true
+  enable_int8: false
+  enable_block_skip: false

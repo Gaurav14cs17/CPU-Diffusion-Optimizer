@@ -1,0 +1,50 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Runtime artifacts
+results/*
+!results/.gitkeep
+*.log
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Local secrets / env
+.env
+.env.*
+
+# UI (future node deps)
+ui/node_modules/
+ui/dist/
+ui/.next/
+ui/.turbo/
+
+# Experiment databases
+*.db
+*.sqlite
+*.sqlite3
