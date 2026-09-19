@@ -1,7 +1,8 @@
-"""Text → image generation for the agent chat.
+"""Text → image generation via offline CPU models (multi-model catalog).
 
-Primary: HTTP image API (no local GPU required).
-Fallback: toy diffusion latent visualization seeded from the prompt.
+Primary: Diffusers entries from ``configs/txt2img_models.yaml``.
+Fallback: built-in ``toy_diffusion``.
+No third-party online image APIs.
 """
 
 from __future__ import annotations
@@ -9,18 +10,25 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
+from typing import Any
+
+from engine.agent.txt2img_models import (
+    Txt2ImgModel,
+    extract_model_hint,
+    get_model,
+    strip_model_hint,
+)
 
 logger = logging.getLogger(__name__)
+
+# Cached loaded Diffusers pipelines (key = hf_id|size).
+_DIFFUSERS_CACHE: dict[str, Any] = {}
 
 
 def extract_image_prompt(message: str) -> str:
     """Pull a usable prompt out of casual chat text."""
     text = message.strip()
-    # Common prefixes
     patterns = [
         r"^(please\s+)?(can you\s+)?(generate|genrate|generat|create|draw|make|paint|render|show)\s+(me\s+)?(an?\s+)?(image|picture|photo|png)?\s*(of\s+|for\s+|about\s+)?",
         r"^(i want\s+(you to\s+)?(generate|genrate|create|draw|make)\s+(an?\s+)?(image|picture)?\s*(of\s+)?)?",
@@ -32,6 +40,7 @@ def extract_image_prompt(message: str) -> str:
     cleaned = re.sub(r"^(an?|the)\s+", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = cleaned.strip(" .,!?:;\"'")
     cleaned = re.sub(r"\s+(image|picture|photo|png)$", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = strip_model_hint(cleaned)
     return cleaned or text
 
 
@@ -39,7 +48,7 @@ def is_image_generation_request(message: str) -> bool:
     text = message.lower().strip()
     verbs = (
         "generate",
-        "genrate",  # common typo
+        "genrate",
         "generat",
         "create",
         "draw",
@@ -73,7 +82,6 @@ def is_image_generation_request(message: str) -> bool:
         return True
     if has_noun and has_subject:
         return True
-    # "generate a cat" / "draw dog"
     if has_verb and len(text.split()) <= 12:
         return True
     return False
@@ -85,83 +93,254 @@ def _slug(prompt: str) -> str:
     return f"{words or 'image'}_{digest}"
 
 
-def _generate_via_pollinations(prompt: str, dest: Path, *, width: int = 512, height: int = 512) -> bool:
-    """Fetch a generated image from the public Pollinations endpoint."""
-    quoted = urllib.parse.quote(prompt)
-    url = (
-        f"https://image.pollinations.ai/prompt/{quoted}"
-        f"?width={width}&height={height}&nologo=true&enhance=true"
-    )
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "cpu-diffusion-optimizer/0.1"},
+def _prompt_seed(prompt: str) -> int:
+    return int(hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8], 16) % (2**31)
+
+
+def _resolve_model(model_key: str | None) -> Txt2ImgModel:
+    return get_model(model_key)
+
+
+def _get_loaded_diffusers(model: Txt2ImgModel) -> Any:
+    from engine.core.config import ModelConfig
+    from engine.model.loader import load_model
+
+    model_id = model.hf_id
+    size = max(64, model.size)
+    cache_key = f"{model_id}|{size}"
+    if cache_key not in _DIFFUSERS_CACHE:
+        config = ModelConfig(
+            name=model.key,
+            kind="diffusers",
+            path=model_id,
+            height=size,
+            width=size,
+            num_steps=max(1, model.steps),
+            batch_size=1,
         )
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = resp.read()
-        if len(data) < 1000:
-            return False
-        dest.write_bytes(data)
-        return True
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        logger.warning("Pollinations image gen failed: %s", exc)
-        return False
+        logger.info("Loading CPU Diffusers model %s (first call may download)…", model_id)
+        _DIFFUSERS_CACHE[cache_key] = load_model(config)
+    return _DIFFUSERS_CACHE[cache_key]
 
 
-def _generate_via_toy_diffusion(prompt: str, dest: Path) -> bool:
-    """Deterministic toy-latent fallback when network image gen is unavailable."""
+def _generate_via_diffusers(prompt: str, dest: Path, model: Txt2ImgModel) -> tuple[bool, str]:
+    try:
+        loaded = _get_loaded_diffusers(model)
+        model_id = model.hf_id
+        steps = max(1, model.steps)
+        size = max(64, model.size)
+        seed = _prompt_seed(prompt)
+        result = loaded.adapter.run_inference(
+            loaded.module,
+            num_steps=steps,
+            batch_size=1,
+            seed=seed,
+            prompt=prompt,
+            height=size,
+            width=size,
+            guidance_scale=model.guidance_scale,
+        )
+        pil = result.get("pil_image")
+        if pil is not None:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            pil.save(dest, format="PNG")
+        else:
+            from engine.benchmark.visualize import save_latent_image
+
+            save_latent_image(result["output"], dest)
+        return True, model_id
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Diffusers CPU image gen failed (%s): %s", model.hf_id, exc)
+        return False, model.hf_id
+
+
+def _generate_via_toy(prompt: str, dest: Path, model: Txt2ImgModel | None = None) -> bool:
     try:
         from engine.benchmark.visualize import save_latent_image
-        from examples.toy_diffusion.model import build_toy_model
+        from engine.core.config import ModelConfig
+        from engine.model.loader import load_model
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Toy fallback import failed: %s", exc)
+        logger.warning("Toy pipeline import failed: %s", exc)
         return False
 
-    seed = int(hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8], 16) % (2**31)
-    model = build_toy_model(height=32, width=32, hidden_dim=32, num_blocks=4, seed=seed)
-    out = model.sample(num_steps=12, batch_size=1, seed=seed)
-    tensor = out["output"]
-    assert hasattr(tensor, "shape")
-    save_latent_image(tensor, dest)  # type: ignore[arg-type]
-    return True
+    seed = _prompt_seed(prompt)
+    steps = model.steps if model and model.kind == "toy_diffusion" else 24
+    config = ModelConfig(
+        name="toy",
+        kind="toy_diffusion",
+        channels=4,
+        height=32,
+        width=32,
+        hidden_dim=64,
+        num_blocks=6,
+        num_steps=steps,
+        batch_size=1,
+    )
+    try:
+        loaded = load_model(config)
+        result = loaded.adapter.run_inference(
+            loaded.module,
+            num_steps=config.num_steps,
+            batch_size=config.batch_size,
+            seed=seed,
+        )
+        save_latent_image(result["output"], dest)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Toy pipeline image gen failed: %s", exc)
+        return False
 
 
-def generate_image(prompt: str, output_dir: Path) -> dict[str, str | bool]:
-    """Generate an image for ``prompt`` and write it under ``output_dir``."""
+def generate_image(
+    prompt: str,
+    output_dir: Path,
+    *,
+    model_key: str | None = None,
+) -> dict[str, str | bool]:
+    """Generate an image for ``prompt`` offline on CPU using the selected model."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    hint = extract_model_hint(prompt)
     clean = extract_image_prompt(prompt)
-    filename = f"gen_{_slug(clean)}.png"
+    try:
+        model = _resolve_model(model_key or hint)
+    except KeyError as exc:
+        return {"ok": False, "prompt": clean, "message": str(exc)}
+
+    filename = f"gen_{_slug(clean)}_{model.key.replace('/', '_')}.png"
     dest = output_dir / filename
 
-    backend = "pollinations"
-    ok = _generate_via_pollinations(clean, dest)
-    if not ok:
-        backend = "toy_diffusion_latent"
-        ok = _generate_via_toy_diffusion(clean, dest)
+    if model.kind == "toy_diffusion":
+        ok = _generate_via_toy(clean, dest, model)
+        if ok:
+            return {
+                "ok": True,
+                "prompt": clean,
+                "path": str(dest),
+                "url": f"/results/images/{filename}",
+                "backend": "toy_diffusion_pipeline",
+                "model_key": model.key,
+                "message": (
+                    f'Generated image for prompt: "{clean}"\n'
+                    f"Saved: results/images/{filename}\n"
+                    f"Backend: toy_diffusion (offline CPU)\n"
+                    f"Model key: {model.key}"
+                ),
+            }
+        return {"ok": False, "prompt": clean, "message": "Toy diffusion generation failed."}
 
-    if not ok:
+    ok, model_id = _generate_via_diffusers(clean, dest, model)
+    if ok:
+        backend = f"diffusers:{model_id}"
+        return {
+            "ok": True,
+            "prompt": clean,
+            "path": str(dest),
+            "url": f"/results/images/{filename}",
+            "backend": backend,
+            "model_key": model.key,
+            "message": (
+                f'Generated image for prompt: "{clean}"\n'
+                f"Saved: results/images/{filename}\n"
+                f"Backend: {backend} (offline CPU)\n"
+                f"Catalog key: {model.key} · steps={model.steps} · size={model.size}\n"
+                f"{model.notes}"
+            ),
+        }
+
+    # Fall back to toy if Diffusers fails
+    ok = _generate_via_toy(clean, dest)
+    if ok:
+        return {
+            "ok": True,
+            "prompt": clean,
+            "path": str(dest),
+            "url": f"/results/images/{filename}",
+            "backend": "toy_diffusion_pipeline",
+            "model_key": "toy",
+            "message": (
+                f'Generated image for prompt: "{clean}"\n'
+                f"Saved: results/images/{filename}\n"
+                f"Backend: toy_diffusion (fallback after {model.key} failed)\n"
+                'Install/check: pip install -e ".[diffusers]" · `list models`'
+            ),
+        }
+
+    return {
+        "ok": False,
+        "prompt": clean,
+        "message": f"Image generation failed for model '{model.key}'.",
+    }
+
+
+def edit_image(
+    prompt: str,
+    source_path: Path,
+    output_dir: Path,
+    *,
+    model_key: str | None = None,
+    strength: float = 0.55,
+) -> dict[str, str | bool | float]:
+    """Text-guided img2img edit of an uploaded/source image (offline CPU)."""
+    from PIL import Image
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    clean = extract_image_prompt(prompt)
+    if not source_path.is_file():
+        return {"ok": False, "prompt": clean, "message": f"Source image not found: {source_path}"}
+
+    try:
+        model = _resolve_model(model_key)
+    except KeyError as exc:
+        return {"ok": False, "prompt": clean, "message": str(exc)}
+
+    if model.kind == "toy_diffusion":
         return {
             "ok": False,
             "prompt": clean,
-            "message": "Image generation failed (network and local fallback).",
+            "message": "Img2img needs a Diffusers model. Use `use model sd-turbo` (not toy).",
         }
 
-    rel = f"/results/images/{filename}"
-    note = (
-        f'Generated image for prompt: "{clean}"\n'
-        f"Saved: results/images/{filename}\n"
-        f"Backend: {backend}"
-    )
-    if backend == "toy_diffusion_latent":
-        note += (
-            "\n(Network image API unavailable — showing toy diffusion latent "
-            "visualization seeded from your prompt.)"
+    filename = f"edit_{_slug(clean)}_{model.key.replace('/', '_')}.png"
+    dest = output_dir / filename
+    try:
+        loaded = _get_loaded_diffusers(model)
+        init = Image.open(source_path).convert("RGB")
+        # Prefer adapter method when available
+        adapter = loaded.adapter
+        if not hasattr(adapter, "run_img2img"):
+            return {"ok": False, "prompt": clean, "message": "Adapter has no img2img support."}
+        result = adapter.run_img2img(
+            loaded.module,
+            prompt=clean,
+            init_image=init,
+            num_steps=max(1, model.steps),
+            strength=strength,
+            seed=_prompt_seed(clean + str(source_path)),
+            guidance_scale=model.guidance_scale,
+            height=max(64, model.size),
+            width=max(64, model.size),
         )
-    return {
-        "ok": True,
-        "prompt": clean,
-        "path": str(dest),
-        "url": rel,
-        "backend": backend,
-        "message": note,
-    }
+        pil = result["pil_image"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        pil.save(dest, format="PNG")
+        backend = f"diffusers-img2img:{model.hf_id}"
+        return {
+            "ok": True,
+            "prompt": clean,
+            "path": str(dest),
+            "url": f"/results/images/{filename}",
+            "backend": backend,
+            "model_key": model.key,
+            "strength": float(strength),
+            "source": str(source_path),
+            "message": (
+                f'Text-guided edit: "{clean}"\n'
+                f"Source: {source_path.name}\n"
+                f"Saved: results/images/{filename}\n"
+                f"Backend: {backend}\n"
+                f"strength={strength:.2f} · steps={model.steps} · model={model.key}"
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Img2img failed: %s", exc)
+        return {"ok": False, "prompt": clean, "message": f"Img2img failed: {exc}"}

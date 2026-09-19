@@ -7,13 +7,14 @@ import {
   useRef,
   useState,
 } from "react";
-import { agentChat, apiHealth, resultsApi } from "./services/api";
+import { agentChat, apiHealth, editTxt2Img, fetchTxt2ImgModels, resultsApi, selectTxt2ImgModel, uploadTxt2ImgSource } from "./services/api";
 import type {
   CacheStats,
   ComparisonPayload,
   ProfilePayload,
   Screen,
 } from "./types";
+import type { Txt2ImgModelInfo } from "./services/api";
 import "./styles.css";
 
 function looksLikeImageRequest(msg: string): boolean {
@@ -46,6 +47,7 @@ const ACTIVITY: { id: Screen; label: string; icon: string }[] = [
   { id: "optimize", label: "Optimize", icon: "⚡" },
   { id: "experiments", label: "Experiments", icon: "◎" },
   { id: "benchmark", label: "Benchmark", icon: "▤" },
+  { id: "generated", label: "Generated", icon: "◈" },
 ];
 
 const FILES = [
@@ -71,7 +73,7 @@ function Badge({ decision }: { decision: string }) {
 }
 
 export default function App() {
-  const [screen, setScreen] = useState<Screen>("benchmark");
+  const [screen, setScreen] = useState<Screen>("generated");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [agentOpen, setAgentOpen] = useState(true);
   const [bottomTab, setBottomTab] = useState<"terminal" | "output">("terminal");
@@ -89,15 +91,25 @@ export default function App() {
     "$ cdo — CPU Diffusion Optimizer\nConnecting to engine API…\n",
   );
   const [agentInput, setAgentInput] = useState("");
+  const [txt2imgModels, setTxt2imgModels] = useState<Txt2ImgModelInfo[]>([]);
+  const [txt2imgActive, setTxt2imgActive] = useState("auto");
+  const [txt2imgDefault, setTxt2imgDefault] = useState("sd-turbo");
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [generatedImages, setGeneratedImages] = useState<string[]>([]);
+  const [generatedCaption, setGeneratedCaption] = useState("");
+  const [sourceImageUrl, setSourceImageUrl] = useState<string | null>(null);
+  const [sourceImagePath, setSourceImagePath] = useState<string | null>(null);
+  const [editStrength, setEditStrength] = useState(0.55);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [agentLog, setAgentLog] = useState<ChatMsg[]>([
     {
       role: "assistant",
       text:
-        "Composer ready.\n\nOptimization: `profile` · `run experiment` · `compare` · `cache`\nImages: `generate a cat image` · `draw a dog`\n\nImages appear below the reply in this panel.",
+        "Composer ready.\n\n1) Pick a model  2) Upload an image (optional)  3) Generate or Edit with text.\n`generate a cat image` · Upload → type guidance → Edit",
     },
   ]);
   const [openTabs, setOpenTabs] = useState<EditorTab[]>([
-    { id: "benchmark", title: "comparison.json" },
+    { id: "generated", title: "generated.png" },
   ]);
 
   const images = useMemo(() => resultsApi.imageUrls(), []);
@@ -120,7 +132,7 @@ export default function App() {
     setOpenTabs((tabs) => {
       const next = tabs.filter((t) => t.id !== id);
       if (screen === id && next.length) setScreen(next[next.length - 1].id as Screen);
-      return next.length ? next : [{ id: "project", title: "Welcome" }];
+      return next.length ? next : [{ id: "generated", title: "generated.png" }];
     });
   }
 
@@ -144,6 +156,14 @@ export default function App() {
       const ok = await apiHealth();
       setApiOk(ok);
       await refreshArtifacts();
+      if (ok) {
+        const catalog = await fetchTxt2ImgModels();
+        if (catalog) {
+          setTxt2imgModels(catalog.models);
+          setTxt2imgDefault(catalog.default);
+          setTxt2imgActive(catalog.active || catalog.default);
+        }
+      }
       setTerminal(
         (t) =>
           t +
@@ -153,10 +173,158 @@ export default function App() {
     })();
   }, []);
 
+  async function onUploadSource(file: File | null) {
+    if (!file || busy) return;
+    setBusy(true);
+    setBusyHint("Uploading image…");
+    try {
+      // Img2img needs a Diffusers model — auto-switch off toy
+      if (txt2imgActive === "toy") {
+        const catalog = await selectTxt2ImgModel("sd-turbo");
+        setTxt2imgModels(catalog.models);
+        setTxt2imgDefault(catalog.default);
+        setTxt2imgActive(catalog.active);
+      }
+      const up = await uploadTxt2ImgSource(file);
+      const url = `${up.url}${up.url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+      setSourceImageUrl(url);
+      setSourceImagePath(up.path);
+      setGeneratedImages([url]);
+      setGeneratedCaption(
+        `Uploaded source: ${up.filename}\nReady for text-guided edit.\nType a prompt and click Edit (not Generate).`,
+      );
+      openScreen("generated", "source.png");
+      setTerminal((t) => t + `\n$ upload ${up.filename} → ${up.path}\n`);
+      setAgentLog((log) => [
+        ...log,
+        {
+          role: "assistant",
+          text:
+            `Uploaded ${up.filename}.\n` +
+            `Shown in the main canvas.\n` +
+            `Type guidance (e.g. make it snowy night) and click Edit.`,
+          images: [url],
+          tool: "upload_image",
+        },
+      ]);
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      setTerminal((t) => t + `✗ upload failed: ${text}\n`);
+      setAgentLog((log) => [
+        ...log,
+        { role: "assistant", text: `Upload failed: ${text}`, tool: "upload_image" },
+      ]);
+    } finally {
+      setBusy(false);
+      setBusyHint("");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  function clearSourceImage() {
+    setSourceImageUrl(null);
+    setSourceImagePath(null);
+    setGeneratedImages([]);
+    setGeneratedCaption("");
+    openScreen("generated", "generated.png");
+  }
+
+  async function onEditWithText() {
+    const prompt = agentInput.trim();
+    if (!prompt || !sourceImagePath || busy) return;
+    setBusy(true);
+    setBusyHint("Editing image with text… (CPU, may take a while)");
+    setAgentLog((log) => [...log, { role: "user", text: `edit: ${prompt}` }]);
+    setTerminal((t) => t + `\n$ img2img strength=${editStrength} ${JSON.stringify(prompt)}\n`);
+    try {
+      const result = await editTxt2Img({
+        prompt,
+        imagePath: sourceImagePath,
+        modelKey: txt2imgActive === "auto" ? undefined : txt2imgActive,
+        strength: editStrength,
+      });
+      if (!result.ok) {
+        throw new Error(result.message || "Edit failed");
+      }
+      const imgs = result.images?.length
+        ? result.images
+        : result.url
+          ? [result.url]
+          : [];
+      setGeneratedImages(imgs);
+      setGeneratedCaption(result.message);
+      // Keep source for further edits; optionally chain: use output as new source
+      if (result.url) {
+        const path = result.url.replace(/^\/results\//, "").split("?")[0];
+        setSourceImagePath(path);
+        setSourceImageUrl(result.url);
+      }
+      setAgentInput("");
+      openScreen("generated", "edited.png");
+      setAgentLog((log) => [
+        ...log,
+        {
+          role: "assistant",
+          text: result.message,
+          images: imgs,
+          tool: "edit_image",
+        },
+      ]);
+      setTerminal((t) => t + `→ ok img2img images=${imgs.length}\n`);
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      setAgentLog((log) => [...log, { role: "assistant", text }]);
+      setTerminal((t) => t + `→ error ${text}\n`);
+    } finally {
+      setBusy(false);
+      setBusyHint("");
+    }
+  }
+
+  async function onSelectTxt2ImgModel(key: string) {
+    setModelMenuOpen(false);
+    try {
+      const catalog = await selectTxt2ImgModel(key);
+      setTxt2imgModels(catalog.models);
+      setTxt2imgDefault(catalog.default);
+      setTxt2imgActive(catalog.active);
+      const label = key === "auto" ? `Auto (${catalog.default})` : catalog.active;
+      setTerminal((t) => t + `\n$ model → ${label}\n`);
+      setAgentLog((log) => [
+        ...log,
+        {
+          role: "assistant",
+          text: `Image model → **${catalog.active}**${
+            key === "auto" ? " (Auto)" : ""
+          }\nReady for \`generate a cat image\`.`,
+          tool: "set_txt2img_model",
+        },
+      ]);
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      setTerminal((t) => t + `✗ model select failed: ${text}\n`);
+    }
+  }
+
+  const activeModelMeta =
+    txt2imgModels.find((m) => m.key === txt2imgActive) ||
+    txt2imgModels.find((m) => m.key === txt2imgDefault);
+  const modelPickerLabel =
+    txt2imgActive === "auto" || txt2imgActive === txt2imgDefault
+      ? `Auto · ${txt2imgDefault}`
+      : activeModelMeta?.name || txt2imgActive;
+
   async function onAgentSubmit(e: FormEvent) {
     e.preventDefault();
     const msg = agentInput.trim();
     if (!msg || busy) return;
+
+    // If a source image is loaded, Enter/Generate should text-edit it (img2img)
+    if (sourceImagePath) {
+      await onEditWithText();
+      return;
+    }
+
     setAgentInput("");
     setAgentOpen(true);
     setAgentLog((log) => [...log, { role: "user", text: msg }]);
@@ -189,8 +357,10 @@ export default function App() {
           "\n",
       );
       await refreshArtifacts();
-      if (result.tool === "generate_image") {
-        // stay on current view; image is in composer
+      if (result.tool === "generate_image" && result.images?.length) {
+        setGeneratedImages(result.images);
+        setGeneratedCaption(result.reply || msg);
+        openScreen("generated", "generated.png");
       } else if (result.tool === "run_experiment" || result.tool === "compare_results") {
         openScreen("benchmark", "comparison.json");
       } else if (result.tool === "profile_model") {
@@ -343,6 +513,9 @@ export default function App() {
               report,
               profileText,
               images,
+              generatedImages,
+              generatedCaption,
+              activeModel: txt2imgActive,
             })}
           </div>
 
@@ -410,9 +583,18 @@ export default function App() {
                   {m.images && m.images.length > 0 && (
                     <div className="agent-images">
                       {m.images.map((src) => (
-                        <a key={src} href={src} target="_blank" rel="noreferrer">
+                        <button
+                          key={src}
+                          type="button"
+                          className="agent-image-btn"
+                          onClick={() => {
+                            setGeneratedImages(m.images || [src]);
+                            setGeneratedCaption(m.text);
+                            openScreen("generated", "generated.png");
+                          }}
+                        >
                           <img src={src} alt="generated" />
-                        </a>
+                        </button>
                       ))}
                     </div>
                   )}
@@ -426,11 +608,22 @@ export default function App() {
               )}
               <div ref={composerEndRef} />
             </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/bmp,image/gif"
+              hidden
+              onChange={(e) => void onUploadSource(e.target.files?.[0] ?? null)}
+            />
             <form className="composer-input" onSubmit={onAgentSubmit}>
               <textarea
                 value={agentInput}
                 onChange={(e) => setAgentInput(e.target.value)}
-                placeholder='Try: generate a cat image'
+                placeholder={
+                  sourceImagePath
+                    ? "Describe how to change the uploaded image…"
+                    : "Try: generate a cat image"
+                }
                 rows={3}
                 disabled={busy}
                 onKeyDown={(e) => {
@@ -441,12 +634,109 @@ export default function App() {
                 }}
               />
               <div className="composer-actions">
-                <span className="hint">
-                  {busy ? busyHint || "Working…" : "Enter send · Shift+Enter newline"}
-                </span>
-                <button type="submit" disabled={busy || !agentInput.trim()}>
-                  {busy ? "…" : "Send"}
+                <div className="model-picker">
+                  <button
+                    type="button"
+                    className="model-picker-btn"
+                    disabled={busy || !apiOk}
+                    onClick={() => setModelMenuOpen((o) => !o)}
+                    title="Choose text-to-image model"
+                  >
+                    <span className="model-picker-label">{modelPickerLabel}</span>
+                    <span className="model-picker-caret">▾</span>
+                  </button>
+                  {modelMenuOpen && (
+                    <div className="model-picker-menu" role="listbox">
+                      <button
+                        type="button"
+                        className={`model-picker-item ${
+                          txt2imgActive === txt2imgDefault || txt2imgActive === "auto"
+                            ? "active"
+                            : ""
+                        }`}
+                        onClick={() => void onSelectTxt2ImgModel("auto")}
+                      >
+                        <span className="model-picker-item-name">Auto</span>
+                        <span className="model-picker-item-meta">
+                          default · {txt2imgDefault}
+                        </span>
+                      </button>
+                      <div className="model-picker-sep" />
+                      {txt2imgModels.map((m) => (
+                        <button
+                          key={m.key}
+                          type="button"
+                          className={`model-picker-item ${
+                            m.key === txt2imgActive ? "active" : ""
+                          }`}
+                          onClick={() => void onSelectTxt2ImgModel(m.key)}
+                          title={m.notes}
+                        >
+                          <span className="model-picker-item-name">{m.name}</span>
+                          <span className="model-picker-item-meta">
+                            {m.key} · {m.steps} step{m.steps === 1 ? "" : "s"} · {m.size}px
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  disabled={busy || !apiOk}
+                  onClick={() => fileInputRef.current?.click()}
+                  title="Upload image for text-guided edit"
+                >
+                  Upload
                 </button>
+                {sourceImagePath && (
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    disabled={busy}
+                    onClick={clearSourceImage}
+                    title="Clear uploaded source"
+                  >
+                    Clear
+                  </button>
+                )}
+                {sourceImagePath && (
+                  <label className="strength-label" title="How strongly text changes the image">
+                    Strength
+                    <input
+                      type="range"
+                      min={0.15}
+                      max={0.95}
+                      step={0.05}
+                      value={editStrength}
+                      disabled={busy}
+                      onChange={(e) => setEditStrength(Number(e.target.value))}
+                    />
+                    <span>{editStrength.toFixed(2)}</span>
+                  </label>
+                )}
+                <span className="hint">
+                  {busy
+                    ? busyHint || "Working…"
+                    : sourceImagePath
+                      ? "Source loaded · Enter / Edit = text-guided change"
+                      : "Enter send · Shift+Enter newline"}
+                </span>
+                {sourceImagePath ? (
+                  <button
+                    type="button"
+                    className="ghost-btn accent"
+                    disabled={busy || !agentInput.trim()}
+                    onClick={() => void onEditWithText()}
+                  >
+                    Edit
+                  </button>
+                ) : (
+                  <button type="submit" disabled={busy || !agentInput.trim()}>
+                    {busy ? "…" : "Generate"}
+                  </button>
+                )}
               </div>
             </form>
           </aside>
@@ -477,8 +767,68 @@ function renderEditor(args: {
   report: string;
   profileText: string;
   images: { baseline: string; optimized: string };
+  generatedImages: string[];
+  generatedCaption: string;
+  activeModel: string;
 }) {
-  const { screen, comparison, profile, cacheStats, report, profileText, images } = args;
+  const {
+    screen,
+    comparison,
+    profile,
+    cacheStats,
+    report,
+    profileText,
+    images,
+    generatedImages,
+    generatedCaption,
+    activeModel,
+  } = args;
+
+  if (screen === "generated") {
+    const hasImage = generatedImages.length > 0;
+    return (
+      <div className={`doc generated-view ${hasImage ? "" : "is-clean"}`}>
+        {hasImage ? (
+          <div className="generated-head">
+            <h1>{sourceImagePath ? "Source / edited image" : "Generated image"}</h1>
+            <p className="muted">
+              Model: <code>{activeModel}</code>
+              {sourceImagePath ? (
+                <>
+                  {" · "}
+                  source ready for text-guided edit
+                </>
+              ) : null}
+              {generatedImages[0] ? (
+                <>
+                  {" · "}
+                  <a href={generatedImages[0]} target="_blank" rel="noreferrer">
+                    open full size
+                  </a>
+                </>
+              ) : null}
+            </p>
+          </div>
+        ) : null}
+        <div className={`generated-stage ${hasImage ? "" : "empty"}`}>
+          {hasImage ? (
+            generatedImages.map((src) => (
+              <a key={src} href={src} target="_blank" rel="noreferrer" className="generated-frame">
+                <img src={src} alt="generated" />
+              </a>
+            ))
+          ) : (
+            <div className="generated-empty" aria-hidden>
+              <div className="generated-empty-mark" />
+            </div>
+          )}
+        </div>
+        {generatedCaption ? (
+          <pre className="code-block generated-caption">{generatedCaption}</pre>
+        ) : null}
+      </div>
+    );
+  }
 
   if (screen === "project") {
     return (

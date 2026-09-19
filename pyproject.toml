@@ -51,14 +51,24 @@ dev = [
 api = [
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
+  "python-multipart>=0.0.9",
 ]
 diffusers = [
   "diffusers>=0.27",
   "transformers>=4.38",
   "accelerate>=0.27",
+  "safetensors>=0.4",
+  "Pillow>=10.0",
+]
+# FastSDCPU-aligned baseline (OpenVINO Turbo/LCM exports via Optimum Intel).
+# Does not install https://github.com/rupeshs/fastsdcpu itself — same model class.
+fastsdcpu = [
+  "cpu-diffusion-optimizer[diffusers]",
+  "optimum[openvino]>=1.17",
+  "openvino>=2024.0",
 ]
 all = [
-  "cpu-diffusion-optimizer[dev,api,diffusers]",
+  "cpu-diffusion-optimizer[dev,api,diffusers,fastsdcpu]",
 ]
 
 [project.scripts]

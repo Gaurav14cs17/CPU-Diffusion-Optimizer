@@ -3,12 +3,14 @@
 CPU-first engine for analyzing, profiling, and optimizing **diffusion-model inference** on CPUs.
 
 <p align="center">
-  <img src="docs/screenshots/ui.png" alt="CPU Diffusion Optimizer UI — agent generating a cat image" width="100%" />
+  <img src="docs/screenshots/ui.png" alt="CPU Diffusion Optimizer UI — agent generating via offline toy pipeline" width="100%" />
 </p>
 
-**Developer UI** — Cursor-like workspace with explorer, benchmark view, terminal, and the **AI Optimization Agent**. The panel above shows `generate a cat image` with the result rendered inline.
+**Developer UI** — Cursor-like workspace with explorer, benchmark view, terminal, and the **AI Optimization Agent**. Image chat supports **many offline CPU models** via `configs/txt2img_models.yaml` (`list models` · `use model sdxs` · `generate a cat with sd-turbo`). Install Diffusers with `pip install -e ".[diffusers]"`.
 
 ## Sample outputs
+
+Offline CPU generation via the agent (`generate a cat image` / `draw a dog`):
 
 | Cat | Dog |
 |-----|-----|
@@ -112,3 +114,7 @@ Designed around x86 AVX2 / AVX-512, ARM NEON (where practical), memory bandwidth
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
+
+## Technical discussion
+
+See [docs/doc.md](docs/doc.md) for architecture, pipeline, caching theory, tradeoffs, and open questions.

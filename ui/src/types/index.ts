@@ -6,6 +6,7 @@ export type Screen =
   | "optimize"
   | "experiments"
   | "benchmark"
+  | "generated"
   | "agent";
 
 export interface ComparisonPayload {

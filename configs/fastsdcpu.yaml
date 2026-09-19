@@ -1,0 +1,45 @@
+# FastSDCPU-aligned baseline experiment (OpenVINO or PyTorch Turbo)
+
+# Not the toy optimization loop — use this to measure a known-fast CPU SD path
+# against our engine (profile / benchmark / quality). Block-cache hooks on the
+# opaque OpenVINO UNet are future work; expect INCONCLUSIVE for cache KEEP.
+
+experiment:
+  name: fastsdcpu_baseline
+  seed: 42
+  output_dir: results/fastsdcpu
+
+model:
+  name: sd_turbo_ov
+  kind: fastsdcpu
+  # openvino:rupeshs/sd-turbo-openvino  (default when OpenVINO extras installed)
+  # pytorch:stabilityai/sd-turbo
+  path: null
+  height: 512
+  width: 512
+  num_steps: 1
+  batch_size: 1
+
+profiler:
+  warmup_runs: 0
+  measure_runs: 1
+  track_memory: true
+
+benchmark:
+  warmup_runs: 0
+  measure_runs: 1
+  quality:
+    metrics: [mse, psnr]
+    max_mse: 0.25
+    min_psnr: 12.0
+
+cache:
+  mode: disabled
+  threshold: 0.05
+  epsilon: 1.0e-6
+  max_consecutive_reuses: 1
+
+optimization:
+  enable_cache: false
+  enable_int8: false
+  enable_block_skip: false

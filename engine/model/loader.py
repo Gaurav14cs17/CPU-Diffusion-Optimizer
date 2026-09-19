@@ -15,6 +15,8 @@ from engine.model.model_info import ModelInfo
 
 # Ensure built-in adapters register themselves.
 from engine.model.adapters import toy as _toy  # noqa: F401
+from engine.model.adapters import diffusers as _diffusers  # noqa: F401
+from engine.model.adapters import fastsdcpu as _fastsdcpu  # noqa: F401
 
 
 @dataclass

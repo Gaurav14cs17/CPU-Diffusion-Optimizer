@@ -34,6 +34,22 @@ export interface AgentChatResult {
   ok: boolean;
 }
 
+export interface Txt2ImgModelInfo {
+  key: string;
+  name: string;
+  path: string | null;
+  steps: number;
+  size: number;
+  notes: string;
+  kind: string;
+}
+
+export interface Txt2ImgModelsResponse {
+  active: string;
+  default: string;
+  models: Txt2ImgModelInfo[];
+}
+
 /** UI reads artifacts / calls engine API — no optimization logic here. */
 export const resultsApi = {
   comparison: () => getJson<ComparisonPayload>("/results/comparison.json"),
@@ -62,10 +78,90 @@ export async function agentChat(
     throw new Error(`Agent API ${res.status}: ${detail}`);
   }
   const data = (await res.json()) as AgentChatResult;
-  // Bust browser cache so newly generated images always show
   data.images = (data.images || []).map((src) =>
     src.includes("?") ? `${src}&t=${Date.now()}` : `${src}?t=${Date.now()}`,
   );
+  return data;
+}
+
+export async function fetchTxt2ImgModels(): Promise<Txt2ImgModelsResponse | null> {
+  return getJson<Txt2ImgModelsResponse>("/api/txt2img/models");
+}
+
+export async function selectTxt2ImgModel(
+  modelKey: string,
+): Promise<Txt2ImgModelsResponse> {
+  const res = await fetch(`${API_BASE}/api/txt2img/models`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model_key: modelKey }),
+  });
+  if (!res.ok) {
+    throw new Error(`Select model failed: ${res.status} ${await res.text()}`);
+  }
+  return (await res.json()) as Txt2ImgModelsResponse;
+}
+
+export interface UploadImageResult {
+  ok: boolean;
+  url: string;
+  path: string;
+  filename: string;
+}
+
+export async function uploadTxt2ImgSource(file: File): Promise<UploadImageResult> {
+  const body = new FormData();
+  body.append("file", file);
+  const res = await fetch(`${API_BASE}/api/txt2img/upload`, {
+    method: "POST",
+    body,
+  });
+  const data = (await res.json().catch(() => ({}))) as UploadImageResult & {
+    message?: string;
+  };
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.message || `Upload failed: ${res.status}`);
+  }
+  return data;
+}
+
+export interface EditImageResult {
+  ok: boolean;
+  message: string;
+  url?: string | null;
+  images: string[];
+  prompt?: string | null;
+  backend?: string | null;
+  model_key?: string | null;
+  strength?: number | null;
+}
+
+export async function editTxt2Img(args: {
+  prompt: string;
+  imagePath: string;
+  modelKey?: string;
+  strength?: number;
+}): Promise<EditImageResult> {
+  const res = await fetch(`${API_BASE}/api/txt2img/edit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt: args.prompt,
+      image_path: args.imagePath,
+      model_key: args.modelKey,
+      strength: args.strength ?? 0.55,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Edit failed: ${res.status} ${await res.text()}`);
+  }
+  const data = (await res.json()) as EditImageResult;
+  data.images = (data.images || []).map((src) =>
+    src.includes("?") ? `${src}&t=${Date.now()}` : `${src}?t=${Date.now()}`,
+  );
+  if (data.url && !data.url.includes("?")) {
+    data.url = `${data.url}?t=${Date.now()}`;
+  }
   return data;
 }
 

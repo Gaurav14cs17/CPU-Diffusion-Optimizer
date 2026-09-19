@@ -24,6 +24,8 @@ TOOL_NAMES = [
     "run_experiment",
     "run_benchmark",
     "list_images",
+    "list_txt2img_models",
+    "set_txt2img_model",
     "generate_image",
 ]
 
@@ -60,11 +62,13 @@ def tool_help() -> dict[str, Any]:
             "• experiment / optimize — run baseline vs cache experiment\n"
             "• compare / results — show last measured results\n"
             "• cache — cache hit rate\n"
-            "• graph / model — model graph\n"
+            "• graph — model graph\n"
             "• hardware — CPU features\n"
             "• images — list saved images\n"
-            "• generate a cat image — text-to-image in chat\n"
-            "• draw a dog — same"
+            "• list models — CPU txt2img catalog (sd-turbo, sdxs, bk-sdm-tiny, …)\n"
+            "• use model sd-turbo — select active image model\n"
+            "• generate a cat image — offline CPU Diffusers\n"
+            "• generate a dog with sdxs — one-shot model override"
         ),
         "tools": TOOL_NAMES,
     }
@@ -249,10 +253,54 @@ def tool_list_images() -> dict[str, Any]:
     return {"ok": True, "message": msg, "images": urls}
 
 
-def tool_generate_image(prompt: str = "a scenic landscape") -> dict[str, Any]:
+def tool_list_txt2img_models() -> dict[str, Any]:
+    from engine.agent.txt2img_models import format_model_list, get_active_key, list_models
+
+    models = [
+        {
+            "key": m.key,
+            "name": m.name,
+            "path": m.path,
+            "steps": m.steps,
+            "size": m.size,
+            "notes": m.notes,
+        }
+        for m in list_models()
+    ]
+    return {
+        "ok": True,
+        "message": format_model_list(),
+        "active": get_active_key(),
+        "models": models,
+    }
+
+
+def tool_set_txt2img_model(model_key: str = "sd-turbo") -> dict[str, Any]:
+    from engine.agent.txt2img_models import set_active_key
+
+    try:
+        model = set_active_key(model_key)
+    except KeyError as exc:
+        return {"ok": False, "message": str(exc)}
+    return {
+        "ok": True,
+        "message": (
+            f"Active txt2img model → **{model.key}** ({model.path or model.kind})\n"
+            f"steps={model.steps} size={model.size}\n{model.notes}\n\n"
+            "Next: `generate a cat image`"
+        ),
+        "active": model.key,
+        "path": model.path,
+    }
+
+
+def tool_generate_image(
+    prompt: str = "a scenic landscape",
+    model_key: str | None = None,
+) -> dict[str, Any]:
     from engine.agent.image_gen import generate_image
 
-    result = generate_image(prompt, _results_dir() / "images")
+    result = generate_image(prompt, _results_dir() / "images", model_key=model_key)
     if not result.get("ok"):
         return {
             "ok": False,
@@ -266,6 +314,7 @@ def tool_generate_image(prompt: str = "a scenic landscape") -> dict[str, Any]:
         "images": [url],
         "prompt": result.get("prompt"),
         "backend": result.get("backend"),
+        "model_key": result.get("model_key"),
     }
 
 
@@ -290,6 +339,8 @@ REGISTRY: dict[str, ToolFn] = {
     "run_experiment": tool_run_experiment,
     "run_benchmark": tool_run_benchmark,
     "list_images": tool_list_images,
+    "list_txt2img_models": tool_list_txt2img_models,
+    "set_txt2img_model": tool_set_txt2img_model,
     "generate_image": tool_generate_image,
 }
 

@@ -1,0 +1,69 @@
+# CPU text-to-image model catalog
+# Switch at runtime: agent "list models" / "use model <key>"
+# Or env: CDO_TXT2IMG_MODEL=<key_or_hf_id>
+
+default: sd-turbo
+
+models:
+  toy:
+    name: Toy diffusion (built-in)
+    kind: toy_diffusion
+    path: null
+    steps: 24
+    size: 32
+    guidance_scale: null
+    notes: Offline latent visualization — no HF download.
+
+  sd-turbo:
+    name: SD Turbo
+    kind: diffusers
+    path: stabilityai/sd-turbo
+    steps: 2
+    size: 512
+    guidance_scale: 0.0
+    notes: Fast ADD model; good CPU default (same family as FastSD).
+
+  sdxl-turbo:
+    name: SDXL Turbo
+    kind: diffusers
+    path: stabilityai/sdxl-turbo
+    steps: 2
+    size: 512
+    guidance_scale: 0.0
+    notes: Higher quality turbo; heavier on CPU RAM.
+
+  sdxs:
+    name: SDXS-512-0.9
+    kind: diffusers
+    path: IDKiro/sdxs-512-0.9
+    steps: 1
+    size: 512
+    guidance_scale: 0.0
+    notes: 1-step CPU-oriented model (FastSD favorite with OpenVINO).
+
+  bk-sdm-tiny:
+    name: BK-SDM Tiny
+    kind: diffusers
+    path: nota-ai/bk-sdm-tiny
+    steps: 20
+    size: 512
+    guidance_scale: 7.5
+    notes: Compressed SD 1.4 UNet (~0.5B); more steps, smaller than full SD.
+
+  tiny-sd:
+    name: Tiny SD (Segmind)
+    kind: diffusers
+    path: segmind/tiny-sd
+    steps: 20
+    size: 512
+    guidance_scale: 7.5
+    notes: Small SD distill; slower than turbo but compact.
+
+  lcm-dreamshaper:
+    name: LCM Dreamshaper v7
+    kind: diffusers
+    path: SimianLuo/LCM_Dreamshaper_v7
+    steps: 4
+    size: 512
+    guidance_scale: 1.0
+    notes: Latent Consistency Model — few steps, FastSD-style LCM path.

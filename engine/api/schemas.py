@@ -61,3 +61,41 @@ class ExperimentSummary(BaseModel):
     experiment_id: str
     name: str
     decision: str
+
+
+class Txt2ImgModelInfo(BaseModel):
+    key: str
+    name: str
+    path: str | None = None
+    steps: int = 2
+    size: int = 512
+    notes: str = ""
+    kind: str = "diffusers"
+
+
+class Txt2ImgModelsResponse(BaseModel):
+    active: str
+    default: str
+    models: list[Txt2ImgModelInfo] = Field(default_factory=list)
+
+
+class Txt2ImgSelectRequest(BaseModel):
+    model_key: str
+
+
+class Txt2ImgEditRequest(BaseModel):
+    prompt: str
+    image_path: str = Field(description="Path under results/uploads or results/images")
+    model_key: str | None = None
+    strength: float = Field(default=0.55, ge=0.05, le=1.0)
+
+
+class Txt2ImgEditResponse(BaseModel):
+    ok: bool
+    message: str
+    url: str | None = None
+    images: list[str] = Field(default_factory=list)
+    prompt: str | None = None
+    backend: str | None = None
+    model_key: str | None = None
+    strength: float | None = None
