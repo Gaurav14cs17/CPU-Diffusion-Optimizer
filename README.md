@@ -2,6 +2,22 @@
 
 CPU-first engine for analyzing, profiling, and optimizing **diffusion-model inference** on CPUs.
 
+## Screenshots
+
+Sample outputs from the agent / image pipeline (CPU):
+
+| Cat | Dog |
+|-----|-----|
+| ![Cat](docs/screenshots/demo_cat.png) | ![Dog](docs/screenshots/demo_dog.png) |
+
+| Generated cat | Generated dog |
+|---------------|---------------|
+| ![Generated cat](docs/screenshots/generated_cat.png) | ![Generated dog](docs/screenshots/generated_dog.png) |
+
+| Generated cow | Generated apple |
+|---------------|-----------------|
+| ![Generated cow](docs/screenshots/generated_cow.png) | ![Generated apple](docs/screenshots/generated_apple.png) |
+
 This is **not** primarily an image-generation UI. The core product is an **optimization engine** that:
 
 1. Loads a diffusion model
